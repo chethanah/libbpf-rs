@@ -12,6 +12,7 @@ libc = "0.2"
 phf = { version = "0.10", features = ["macros"] }
 plain = "0.2"
 structopt = "0.3"
+libbpf-sys = "0.5.0-2"
 
 [build-dependencies]
 libbpf-cargo = { path = "../../libbpf-cargo" }

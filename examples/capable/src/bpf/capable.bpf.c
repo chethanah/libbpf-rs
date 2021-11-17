@@ -42,6 +42,13 @@ struct {
 } seen
 SEC(".maps");
 
+struct {
+        __uint(type, BPF_MAP_TYPE_CGROUP_ARRAY);
+        __uint(key_size, sizeof(u32));
+        __uint(value_size, sizeof(u32));
+        __uint(max_entries, 1);
+} cgroup_map SEC(".maps");
+
 static __always_inline int record_cap(void *ctx, const struct cred *cred,
                                       struct user_namespace *targ_ns, int cap, int cap_opt) {
 	u64 __pid_tgid = bpf_get_current_pid_tgid();
@@ -58,11 +65,11 @@ static __always_inline int record_cap(void *ctx, const struct cred *cred,
 		audit = cap_opt;
 		insetid = -1;
 	}
-
+    /*
 	if (tool_config.tgid && tgid != tool_config.tgid) {
 		return 0;
 	}
-
+    */
 	if (!tool_config.verbose && audit == 0) {
 		return 0;
 	}
@@ -101,8 +108,11 @@ SEC("kprobe/cap_capable")
 
 int BPF_KPROBE(kprobe__cap_capable, const struct cred *cred,
                struct user_namespace *targ_ns, int cap, int cap_opt) {
-	return record_cap(ctx, cred, targ_ns, cap, cap_opt);
 
+    if (!bpf_current_task_under_cgroup(&cgroup_map, 0))
+        return 0;
+
+	return record_cap(ctx, cred, targ_ns, cap, cap_opt);
 }
 
 char LICENSE[] SEC("license") = "GPL";

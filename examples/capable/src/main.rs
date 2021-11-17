@@ -12,6 +12,15 @@ use libbpf_rs::PerfBufferBuilder;
 use phf::phf_map;
 use plain::Plain;
 use structopt::StructOpt;
+use libbpf_sys;
+use libc::c_int;
+use libc::c_void;
+use std::path::Path;
+use std::fs::File;
+use std::os::unix::io::AsRawFd;
+use std::fs::OpenOptions;
+use std::fs;
+use std::io::Write;
 
 #[path = "bpf/.output/capable.skel.rs"]
 mod capable;
@@ -77,7 +86,7 @@ impl FromStr for uniqueness {
 }
 
 /// Trace capabilities
-#[derive(Debug, Copy, Clone, StructOpt)]
+#[derive(Debug, Clone, StructOpt)]
 #[structopt(name = "examples", about = "Usage instructions")]
 struct Command {
     /// verbose: include non-audit checks
@@ -95,6 +104,12 @@ struct Command {
     /// debug output for libbpf-rs
     #[structopt(long)]
     debug: bool,
+    /// trace cgroup path
+    #[structopt(long, short)]
+    cgroups_path: String,
+    /// output file name
+    #[structopt(short, long, default_value = "/tmp/bpf_capable.log")]
+    output_file: String,
 }
 
 unsafe impl Plain for capable_bss_types::event {}
@@ -126,36 +141,6 @@ fn print_banner(extra_fields: bool) {
     }
 }
 
-fn _handle_event(opts: Command, event: capable_bss_types::event) {
-    let now = Local::now().format("%H:%M:%S");
-    let comm_str = std::str::from_utf8(&event.comm)
-        .unwrap()
-        .trim_end_matches(char::from(0));
-    let cap_name = match CAPS.get(&event.cap) {
-        Some(&x) => x,
-        None => "?",
-    };
-    if opts.extra_fields {
-        println!(
-            "{:9} {:6} {:<6} {:<6} {:<16} {:<4} {:<20} {:<6} {}",
-            now,
-            event.uid,
-            event.tgid,
-            event.pid,
-            comm_str,
-            event.cap,
-            cap_name,
-            event.audit,
-            event.insetid
-        );
-    } else {
-        println!(
-            "{:9} {:6} {:<6} {:<16} {:<4} {:<20} {:<6}",
-            now, event.uid, event.tgid, comm_str, event.cap, cap_name, event.audit
-        );
-    }
-}
-
 fn handle_lost_events(cpu: i32, count: u64) {
     eprintln!("Lost {} events on CPU {}", count, cpu);
 }
@@ -170,20 +155,113 @@ fn main() -> Result<()> {
 
     bump_memlock_rlimit()?;
 
+    // Open
     let mut open_skel = skel_builder.open()?;
     //Pass configuration to BPF
     open_skel.rodata().tool_config.tgid = opts.pid; //tgid in kernel is pid in userland
     open_skel.rodata().tool_config.verbose = opts.verbose;
     open_skel.rodata().tool_config.unique_type = opts.unique_type;
 
+    // load
     let mut skel = open_skel.load()?;
+
+    let mut idx = 0;
+    let path = Path::new(&opts.cgroups_path);
+    let file = match File::open(&path) {
+        Err(_) => panic!("Unable to open cgroupsPath"),
+        Ok(file) => file,
+    };
+    unsafe {
+        let cgroupfd= &mut file.as_raw_fd() as *mut c_int as *mut c_void;
+        let index = &mut idx as *mut c_int as *mut c_void;
+        libbpf_sys::bpf_map_update_elem(skel.maps_mut().cgroup_map().fd(), index, cgroupfd, libbpf_sys::BPF_ANY.into());
+    }
+
+    // attach
     skel.attach()?;
 
+    if Path::new(&opts.output_file).exists() {
+        fs::remove_file(&opts.output_file).unwrap();
+    }
+
     print_banner(opts.extra_fields);
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(&opts.output_file)
+        .unwrap();
+    if opts.extra_fields {
+        if let Err(e) = writeln!(
+            file,
+            "{:9} {:6} {:6} {:6} {:16} {:4} {:20} {:6} {}",
+            "TIME", "UID", "PID", "TID", "COMM", "CAP", "NAME", "AUDIT", "INSETID"
+        ) {
+            eprintln!("Couldn't write to file: {}", e);
+        }
+    } else {
+        if let Err(e) = writeln!(
+            file,
+            "{:9} {:6} {:6} {:16} {:4} {:20} {:6}",
+            "TIME", "UID", "PID", "COMM", "CAP", "NAME", "AUDIT"
+        ) {
+            eprintln!("Couldn't write to file: {}", e);
+        }
+    }
+
     let handle_event = move |_cpu: i32, data: &[u8]| {
         let mut event = capable_bss_types::event::default();
         plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
-        _handle_event(opts, event);
+        let now = Local::now().format("%H:%M:%S");
+        let comm_str = std::str::from_utf8(&event.comm)
+            .unwrap()
+            .trim_end_matches(char::from(0));
+        let cap_name = match CAPS.get(&event.cap) {
+            Some(&x) => x,
+            None => "?",
+        };
+        if opts.extra_fields {
+            if let Err(e) = writeln!(
+                file,
+                "{:9} {:6} {:<6} {:<6} {:<16} {:<4} {:<20} {:<6} {}",
+                now,
+                event.uid,
+                event.tgid,
+                event.pid,
+                comm_str,
+                event.cap,
+                cap_name,
+                event.audit,
+                event.insetid
+            ) {
+                eprintln!("Couldn't write to file: {}", e);
+            }
+            println!(
+                "{:9} {:6} {:<6} {:<6} {:<16} {:<4} {:<20} {:<6} {}",
+                now,
+                event.uid,
+                event.tgid,
+                event.pid,
+                comm_str,
+                event.cap,
+                cap_name,
+                event.audit,
+                event.insetid
+            );
+        } else {
+            if let Err(e) = writeln!(
+                file,
+                "{:9} {:6} {:<6} {:<16} {:<4} {:<20} {:<6}",
+                now, event.uid, event.tgid, comm_str, event.cap, cap_name, event.audit
+            ) {
+                eprintln!("Couldn't write to file: {}", e);
+            }
+            println!(
+                "{:9} {:6} {:<6} {:<16} {:<4} {:<20} {:<6}",
+                now, event.uid, event.tgid, comm_str, event.cap, cap_name, event.audit
+            );
+        }
     };
     let perf = PerfBufferBuilder::new(skel.maps_mut().events())
         .sample_cb(handle_event)
