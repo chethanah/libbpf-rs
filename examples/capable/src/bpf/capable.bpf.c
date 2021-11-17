@@ -42,6 +42,20 @@ struct {
 } seen
 SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key,	u64);
+	__type(value, u64   );
+} cgroup_id
+SEC(".maps");
+
+struct key_t {
+  char comm[30];
+};
+
+int curr_cgroup_id = 0;
+
 static __always_inline int record_cap(void *ctx, const struct cred *cred,
                                       struct user_namespace *targ_ns, int cap, int cap_opt) {
 	u64 __pid_tgid = bpf_get_current_pid_tgid();
@@ -57,10 +71,6 @@ static __always_inline int record_cap(void *ctx, const struct cred *cred,
 	} else {
 		audit = cap_opt;
 		insetid = -1;
-	}
-
-	if (tool_config.tgid && tgid != tool_config.tgid) {
-		return 0;
 	}
 
 	if (!tool_config.verbose && audit == 0) {
@@ -101,8 +111,25 @@ SEC("kprobe/cap_capable")
 
 int BPF_KPROBE(kprobe__cap_capable, const struct cred *cred,
                struct user_namespace *targ_ns, int cap, int cap_opt) {
-	return record_cap(ctx, cred, targ_ns, cap, cap_opt);
 
+    u64 pid = bpf_get_current_pid_tgid() >> 32;
+    if (tool_config.tgid == pid) {
+        u64 container_cgroup_id = bpf_get_current_cgroup_id();
+        bpf_map_update_elem(&cgroup_id, &pid, &container_cgroup_id, BPF_NOEXIST);
+    }
+
+    u64 *tmp = bpf_map_lookup_elem(&cgroup_id, &tool_config);
+    struct key_t key;
+
+    if (tmp) {
+        if ( bpf_get_current_cgroup_id() == *tmp) {
+          bpf_get_current_comm(&key.comm, sizeof(key.comm));
+          bpf_printk("before record_cap comm=%s pid=%d cgroupid=%d",key.comm, pid, *tmp);
+          return record_cap(ctx, cred, targ_ns, cap, cap_opt);
+        }
+    }
+
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

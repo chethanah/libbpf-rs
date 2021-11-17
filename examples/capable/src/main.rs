@@ -11,7 +11,11 @@ use chrono::Local;
 use libbpf_rs::PerfBufferBuilder;
 use phf::phf_map;
 use plain::Plain;
+use std::fs::OpenOptions;
+use std::io::Write;
 use structopt::StructOpt;
+use std::fs;
+use std::path::Path;
 
 #[path = "bpf/.output/capable.skel.rs"]
 mod capable;
@@ -77,7 +81,7 @@ impl FromStr for uniqueness {
 }
 
 /// Trace capabilities
-#[derive(Debug, Copy, Clone, StructOpt)]
+#[derive(Debug, Clone, StructOpt)]
 #[structopt(name = "examples", about = "Usage instructions")]
 struct Command {
     /// verbose: include non-audit checks
@@ -95,6 +99,9 @@ struct Command {
     /// debug output for libbpf-rs
     #[structopt(long)]
     debug: bool,
+    /// output file name
+    #[structopt(short, long, default_value = "/tmp/bpf_capable.log")]
+    output_file: String,
 }
 
 unsafe impl Plain for capable_bss_types::event {}
@@ -126,36 +133,6 @@ fn print_banner(extra_fields: bool) {
     }
 }
 
-fn _handle_event(opts: Command, event: capable_bss_types::event) {
-    let now = Local::now().format("%H:%M:%S");
-    let comm_str = std::str::from_utf8(&event.comm)
-        .unwrap()
-        .trim_end_matches(char::from(0));
-    let cap_name = match CAPS.get(&event.cap) {
-        Some(&x) => x,
-        None => "?",
-    };
-    if opts.extra_fields {
-        println!(
-            "{:9} {:6} {:<6} {:<6} {:<16} {:<4} {:<20} {:<6} {}",
-            now,
-            event.uid,
-            event.tgid,
-            event.pid,
-            comm_str,
-            event.cap,
-            cap_name,
-            event.audit,
-            event.insetid
-        );
-    } else {
-        println!(
-            "{:9} {:6} {:<6} {:<16} {:<4} {:<20} {:<6}",
-            now, event.uid, event.tgid, comm_str, event.cap, cap_name, event.audit
-        );
-    }
-}
-
 fn handle_lost_events(cpu: i32, count: u64) {
     eprintln!("Lost {} events on CPU {}", count, cpu);
 }
@@ -179,11 +156,88 @@ fn main() -> Result<()> {
     let mut skel = open_skel.load()?;
     skel.attach()?;
 
+    if Path::new(&opts.output_file).exists() {
+        fs::remove_file(&opts.output_file).unwrap();
+    }
+
     print_banner(opts.extra_fields);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(&opts.output_file)
+        .unwrap();
+    if opts.extra_fields {
+        if let Err(e) = writeln!(
+            file,
+            "{:9} {:6} {:6} {:6} {:16} {:4} {:20} {:6} {}",
+            "TIME", "UID", "PID", "TID", "COMM", "CAP", "NAME", "AUDIT", "INSETID"
+        ) {
+            eprintln!("Couldn't write to file: {}", e);
+        }
+    } else {
+        if let Err(e) = writeln!(
+            file,
+            "{:9} {:6} {:6} {:16} {:4} {:20} {:6}",
+            "TIME", "UID", "PID", "COMM", "CAP", "NAME", "AUDIT"
+        ) {
+            eprintln!("Couldn't write to file: {}", e);
+        }
+    }
+
     let handle_event = move |_cpu: i32, data: &[u8]| {
         let mut event = capable_bss_types::event::default();
         plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
-        _handle_event(opts, event);
+        let now = Local::now().format("%H:%M:%S");
+        let comm_str = std::str::from_utf8(&event.comm)
+            .unwrap()
+            .trim_end_matches(char::from(0));
+        let cap_name = match CAPS.get(&event.cap) {
+            Some(&x) => x,
+            None => "?",
+        };
+
+        if opts.extra_fields {
+            if let Err(e) = writeln!(
+                file,
+                "{:9} {:6} {:<6} {:<6} {:<16} {:<4} {:<20} {:<6} {}",
+                now,
+                event.uid,
+                event.tgid,
+                event.pid,
+                comm_str,
+                event.cap,
+                cap_name,
+                event.audit,
+                event.insetid
+            ) {
+                eprintln!("Couldn't write to file: {}", e);
+            }
+            println!(
+                "{:9} {:6} {:<6} {:<6} {:<16} {:<4} {:<20} {:<6} {}",
+                now,
+                event.uid,
+                event.tgid,
+                event.pid,
+                comm_str,
+                event.cap,
+                cap_name,
+                event.audit,
+                event.insetid
+            );
+        } else {
+            if let Err(e) = writeln!(
+                file,
+                "{:9} {:6} {:<6} {:<16} {:<4} {:<20} {:<6}",
+                now, event.uid, event.tgid, comm_str, event.cap, cap_name, event.audit
+            ) {
+                eprintln!("Couldn't write to file: {}", e);
+            }
+            println!(
+                "{:9} {:6} {:<6} {:<16} {:<4} {:<20} {:<6}",
+                now, event.uid, event.tgid, comm_str, event.cap, cap_name, event.audit
+            );
+        }
     };
     let perf = PerfBufferBuilder::new(skel.maps_mut().events())
         .sample_cb(handle_event)
